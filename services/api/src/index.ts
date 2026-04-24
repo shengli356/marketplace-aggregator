@@ -1,0 +1,263 @@
+import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from 'aws-lambda';
+import crypto from 'node:crypto';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, PutCommand, QueryCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+import { jsonResponse, parseJsonBody, rawBody } from '../../shared/src/http';
+import { getSigningSecret } from '../../shared/src/secrets';
+import { verifySignedBody } from '../../shared/src/signing';
+import type { ActivityItem, ListingItem, MarketplaceWebhookEvent, PublishQueueMessage } from '../../shared/src/types';
+
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const sqs = new SQSClient({});
+
+const TABLE_NAME = process.env.TABLE_NAME!;
+const PUBLISH_QUEUE_URL = process.env.PUBLISH_QUEUE_URL!;
+const TENANT_ID = 'demo';
+
+export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyStructuredResultV2> {
+  try {
+    const method = event.requestContext.http.method;
+    const path = event.rawPath;
+
+    if (method === 'OPTIONS') return jsonResponse(204, {});
+    if (path === '/listings' && method === 'POST') return await createListing(event);
+    if (path === '/listings' && method === 'GET') return await listListings();
+    if (path === '/webhooks/mock-ebay' && method === 'POST') return await receiveMockWebhook(event);
+
+    return jsonResponse(404, { error: 'Not found' });
+  } catch (error) {
+    console.error('Unhandled API error', error);
+    return jsonResponse(500, { error: 'Internal server error' });
+  }
+}
+
+async function createListing(event: APIGatewayProxyEventV2) {
+  const body = parseJsonBody<{ title?: string; description?: string; price?: number | string }>(event.body, event.isBase64Encoded);
+  const title = String(body.title ?? '').trim();
+  const description = String(body.description ?? '').trim();
+  const price = Number(body.price);
+
+  if (title.length < 3 || title.length > 120) return jsonResponse(400, { error: 'title must be between 3 and 120 characters' });
+  if (description.length > 2000) return jsonResponse(400, { error: 'description must be 2000 characters or less' });
+  if (!Number.isFinite(price) || price <= 0) return jsonResponse(400, { error: 'price must be a positive number' });
+
+  const now = new Date().toISOString();
+  const listingId = crypto.randomUUID();
+  const priceCents = Math.round(price * 100);
+  const publishIdempotencyKey = `${TENANT_ID}:${listingId}:mock-ebay:v1`;
+
+  const listing: ListingItem = {
+    pk: `TENANT#${TENANT_ID}`,
+    sk: `LISTING#${listingId}`,
+    entityType: 'LISTING',
+    tenantId: TENANT_ID,
+    listingId,
+    title,
+    description,
+    priceCents,
+    status: 'PENDING_PUBLISH',
+    marketplace: 'mock-ebay',
+    publishIdempotencyKey,
+    latestActivity: 'Listing created; publish queued',
+    latestActivityAt: now,
+    createdAt: now,
+    updatedAt: now
+  };
+
+  const activity: ActivityItem = {
+    pk: `LISTING#${listingId}`,
+    sk: `ACTIVITY#${now}#listing-created`,
+    entityType: 'ACTIVITY',
+    tenantId: TENANT_ID,
+    listingId,
+    eventId: `listing-created-${listingId}`,
+    eventType: 'listing_created',
+    source: 'app',
+    message: 'Listing created; publish queued',
+    occurredAt: now,
+    createdAt: now
+  };
+
+  await ddb.send(new TransactWriteCommand({
+    TransactItems: [
+      { Put: { TableName: TABLE_NAME, Item: listing, ConditionExpression: 'attribute_not_exists(pk)' } },
+      { Put: { TableName: TABLE_NAME, Item: activity } }
+    ]
+  }));
+
+  const message: PublishQueueMessage = {
+    tenantId: TENANT_ID,
+    listingId,
+    idempotencyKey: publishIdempotencyKey,
+    title,
+    description,
+    priceCents
+  };
+
+  await sqs.send(new SendMessageCommand({ QueueUrl: PUBLISH_QUEUE_URL, MessageBody: JSON.stringify(message) }));
+
+  return jsonResponse(201, { listing: toPublicListing(listing, [activity]) });
+}
+
+async function listListings() {
+  const listingsResult = await ddb.send(new QueryCommand({
+    TableName: TABLE_NAME,
+    KeyConditionExpression: 'pk = :pk AND begins_with(sk, :sk)',
+    ExpressionAttributeValues: { ':pk': `TENANT#${TENANT_ID}`, ':sk': 'LISTING#' }
+  }));
+
+  const listingItems = (listingsResult.Items ?? []) as ListingItem[];
+  listingItems.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+  const listings = await Promise.all(listingItems.map(async (listing) => {
+    const activitiesResult = await ddb.send(new QueryCommand({
+      TableName: TABLE_NAME,
+      KeyConditionExpression: 'pk = :pk AND begins_with(sk, :sk)',
+      ExpressionAttributeValues: { ':pk': `LISTING#${listing.listingId}`, ':sk': 'ACTIVITY#' },
+      ScanIndexForward: false,
+      Limit: 5
+    }));
+    return toPublicListing(listing, (activitiesResult.Items ?? []) as ActivityItem[]);
+  }));
+
+  return jsonResponse(200, { listings });
+}
+
+async function receiveMockWebhook(event: APIGatewayProxyEventV2) {
+  const body = rawBody(event.body, event.isBase64Encoded);
+  const secret = await getSigningSecret();
+  const timestamp = header(event, 'x-mock-timestamp');
+  const signature = header(event, 'x-mock-signature');
+
+  if (!verifySignedBody({ secret, timestamp, signature, body })) return jsonResponse(401, { error: 'invalid webhook signature' });
+
+  const marketplaceEvent = JSON.parse(body) as MarketplaceWebhookEvent;
+  const validationError = validateMarketplaceEvent(marketplaceEvent);
+  if (validationError) return jsonResponse(400, { error: validationError });
+
+  const now = new Date().toISOString();
+  const ttl = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
+
+  try {
+    await ddb.send(new PutCommand({
+      TableName: TABLE_NAME,
+      Item: { pk: `WEBHOOK#${marketplaceEvent.eventId}`, sk: 'DEDUP', entityType: 'WEBHOOK_DEDUP', eventId: marketplaceEvent.eventId, ttl, createdAt: now },
+      ConditionExpression: 'attribute_not_exists(pk)'
+    }));
+  } catch (error: any) {
+    if (error?.name === 'ConditionalCheckFailedException') return jsonResponse(200, { duplicate: true });
+    throw error;
+  }
+
+  const activity = activityFromWebhook(marketplaceEvent, now);
+  const update = listingUpdateForEvent(marketplaceEvent, activity.message, now);
+
+  await ddb.send(new TransactWriteCommand({
+    TransactItems: [
+      { Put: { TableName: TABLE_NAME, Item: activity } },
+      {
+        Update: {
+          TableName: TABLE_NAME,
+          Key: { pk: `TENANT#${marketplaceEvent.tenantId}`, sk: `LISTING#${marketplaceEvent.listingId}` },
+          UpdateExpression: update.expression,
+          ConditionExpression: 'attribute_exists(pk)',
+          ExpressionAttributeNames: update.names,
+          ExpressionAttributeValues: update.values
+        }
+      }
+    ]
+  }));
+
+  return jsonResponse(202, { ok: true });
+}
+
+function activityFromWebhook(event: MarketplaceWebhookEvent, createdAt: string): ActivityItem {
+  const occurredAt = event.occurredAt || createdAt;
+  const buyerAlias = String(event.payload?.buyerAlias ?? 'buyer');
+  const commentText = String(event.payload?.commentText ?? '').slice(0, 500);
+  const messageByType: Record<MarketplaceWebhookEvent['eventType'], string> = {
+    listing_published: `Published to mock eBay as ${event.marketplaceListingId}`,
+    publish_failed: 'Mock eBay rejected the publish request',
+    new_comment: `${buyerAlias} commented: ${commentText || '(empty comment)'}`,
+    item_sold: `Item sold on mock eBay to ${buyerAlias}`
+  };
+  return {
+    pk: `LISTING#${event.listingId}`,
+    sk: `ACTIVITY#${occurredAt}#${event.eventId}`,
+    entityType: 'ACTIVITY',
+    tenantId: event.tenantId,
+    listingId: event.listingId,
+    eventId: event.eventId,
+    eventType: event.eventType,
+    source: 'mock-ebay',
+    message: messageByType[event.eventType],
+    occurredAt,
+    createdAt,
+    raw: event
+  };
+}
+
+function listingUpdateForEvent(event: MarketplaceWebhookEvent, latestActivity: string, now: string) {
+  const names: Record<string, string> = { '#updatedAt': 'updatedAt', '#latestActivity': 'latestActivity', '#latestActivityAt': 'latestActivityAt' };
+  const values: Record<string, unknown> = { ':updatedAt': now, ':latestActivity': latestActivity, ':latestActivityAt': event.occurredAt || now };
+  const sets = ['#updatedAt = :updatedAt', '#latestActivity = :latestActivity', '#latestActivityAt = :latestActivityAt'];
+
+  if (event.eventType === 'listing_published') {
+    names['#status'] = 'status';
+    names['#marketplaceListingId'] = 'marketplaceListingId';
+    values[':status'] = 'PUBLISHED';
+    values[':marketplaceListingId'] = event.marketplaceListingId;
+    sets.push('#status = :status', '#marketplaceListingId = :marketplaceListingId');
+  }
+  if (event.eventType === 'publish_failed') {
+    names['#status'] = 'status';
+    values[':status'] = 'PUBLISH_FAILED';
+    sets.push('#status = :status');
+  }
+  if (event.eventType === 'item_sold') {
+    names['#status'] = 'status';
+    values[':status'] = 'SOLD';
+    sets.push('#status = :status');
+  }
+
+  return { expression: `SET ${sets.join(', ')}`, names, values };
+}
+
+function validateMarketplaceEvent(event: MarketplaceWebhookEvent): string | undefined {
+  if (!event.eventId) return 'eventId is required';
+  if (!event.listingId) return 'listingId is required';
+  if (event.tenantId !== TENANT_ID) return 'unknown tenant';
+  if (event.marketplace !== 'mock-ebay') return 'unknown marketplace';
+  if (!event.marketplaceListingId) return 'marketplaceListingId is required';
+  if (!['listing_published', 'publish_failed', 'new_comment', 'item_sold'].includes(event.eventType)) return 'unsupported eventType';
+  return undefined;
+}
+
+function toPublicListing(listing: ListingItem, activities: ActivityItem[]) {
+  return {
+    listingId: listing.listingId,
+    title: listing.title,
+    description: listing.description,
+    priceCents: listing.priceCents,
+    status: listing.status,
+    marketplace: listing.marketplace,
+    marketplaceListingId: listing.marketplaceListingId,
+    latestActivity: listing.latestActivity,
+    latestActivityAt: listing.latestActivityAt,
+    createdAt: listing.createdAt,
+    updatedAt: listing.updatedAt,
+    activities: activities.map((activity) => ({
+      eventId: activity.eventId,
+      eventType: activity.eventType,
+      source: activity.source,
+      message: activity.message,
+      occurredAt: activity.occurredAt
+    }))
+  };
+}
+
+function header(event: APIGatewayProxyEventV2, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  return event.headers?.[lower] ?? event.headers?.[name];
+}

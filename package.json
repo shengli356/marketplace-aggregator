@@ -1,0 +1,30 @@
+{
+  "name": "marketplace-aggregator-starter",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": ["frontend"],
+  "scripts": {
+    "build": "npm run build --workspace frontend",
+    "deploy": "npm install && npm run build --workspace frontend && cdk deploy --require-approval never",
+    "destroy": "cdk destroy --force",
+    "synth": "npm run build --workspace frontend && cdk synth",
+    "smoke": "node scripts/smoke.mjs",
+    "trigger:event": "node scripts/trigger-event.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.782.0",
+    "@aws-sdk/client-secrets-manager": "^3.782.0",
+    "@aws-sdk/client-sqs": "^3.782.0",
+    "@aws-sdk/lib-dynamodb": "^3.782.0",
+    "aws-cdk-lib": "^2.190.0",
+    "constructs": "^10.4.2"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.147",
+    "@types/node": "^22.13.10",
+    "aws-cdk": "^2.190.0",
+    "esbuild": "^0.25.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.2"
+  }
+}
