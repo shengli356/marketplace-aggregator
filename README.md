@@ -17,10 +17,7 @@ Minimal serverless slice for a marketplace aggregator. A seller can create a lis
 
 ```mermaid
 flowchart TB
-  %% Client + hosting
-  subgraph Client["Client"]
-    Browser["Seller Browser"]
-  end
+  Browser["Seller Browser"]
 
   subgraph Frontend["Frontend Hosting"]
     CF["CloudFront"]
@@ -30,8 +27,7 @@ flowchart TB
   Browser --> CF
   CF --> S3
 
-  %% Backend API
-  subgraph APIGroup["Backend API"]
+  subgraph Backend["Backend API"]
     APIGW["API Gateway HTTP API"]
     AppAPI["App API Lambda<br/>/listings<br/>/webhooks/mock-ebay"]
   end
@@ -39,17 +35,15 @@ flowchart TB
   Browser --> APIGW
   APIGW --> AppAPI
 
-  %% Persistence + secrets
-  subgraph Data["Persistence / Secrets"]
-    DDB[("DynamoDB<br/>Listings + Activity Feed")]
-    Secrets["Secrets Manager<br/>HMAC + Basic Auth"]
+  subgraph Data["Persistence and Secrets"]
+    DDB[("DynamoDB<br/>Listings and Activity Feed")]
+    Secrets["Secrets Manager<br/>HMAC and Basic Auth"]
   end
 
   AppAPI <--> DDB
   Secrets --> AppAPI
 
-  %% Publish flow
-  subgraph PublishFlow["Async Publish Flow"]
+  subgraph Publish["Async Publish Flow"]
     PublishQueue["SQS Publish Queue"]
     PublishWorker["Publish Worker Lambda"]
     PublishDLQ["Publish DLQ"]
@@ -58,34 +52,33 @@ flowchart TB
 
   AppAPI -->|"enqueue publish job"| PublishQueue
   PublishQueue -->|"SQS event source"| PublishWorker
-  PublishQueue -. "after max retries" .-> PublishDLQ
+  PublishQueue -.->|"after max retries"| PublishDLQ
   PublishDLQ -->|"SQS event source"| PublishDLQHandler
   PublishDLQHandler -->|"mark PUBLISH_FAILED"| DDB
   Secrets --> PublishWorker
 
-  %% Mock marketplace
   subgraph Marketplace["Mock Marketplace Boundary"]
     MockAPI["Mock Marketplace Lambda<br/>/mock-marketplace/publish<br/>/mock-marketplace/events"]
     EventQueue["SQS Mock Event Queue"]
-    EventDLQ["Mock Event DLQ"]
     EventEmitter["Mock Event Emitter Lambda"]
+    EventDLQ["Mock Event DLQ"]
   end
 
   PublishWorker -->|"signed POST /mock-marketplace/publish"| APIGW
   APIGW --> MockAPI
 
-  MockAPI -->|"enqueue listing_published / comment / sale"| EventQueue
+  MockAPI -->|"enqueue marketplace event"| EventQueue
   EventQueue -->|"SQS event source"| EventEmitter
-  EventQueue -. "after max retries" .-> EventDLQ
+  EventQueue -.->|"after max retries"| EventDLQ
+
   Secrets --> MockAPI
   Secrets --> EventEmitter
 
-  %% Webhook delivery
   EventEmitter -->|"signed POST /webhooks/mock-ebay"| APIGW
-  AppAPI -->|"verify HMAC + update feed"| DDB
+  AppAPI -->|"verify HMAC and update feed"| DDB
 
-  %% UI refresh
-  Browser -. "polls GET /listings every 3s" .-> APIGW
+  Browser -.->|"poll GET /listings every 3s"| APIGW
+```
 
 ## Prerequisites
 
