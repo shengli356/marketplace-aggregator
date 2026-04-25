@@ -1,3 +1,17 @@
+/**
+ * Publish Worker Lambda
+ *
+ * Trigger: SQS publish queue.
+ *
+ * Responsibility:
+ * - consume listing publish messages
+ * - call the mock marketplace publish endpoint using an internal HMAC signature
+ *
+ * Failure model:
+ * - on transient errors (429/503), the message will be retried by SQS
+ * - after maxReceiveCount, messages land in the Publish DLQ
+ */
+
 import type { SQSEvent, SQSBatchResponse } from 'aws-lambda';
 import { getSigningSecret } from '../../shared/src/secrets';
 import { signedHeaders } from '../../shared/src/signing';
@@ -5,6 +19,10 @@ import type { PublishQueueMessage } from '../../shared/src/types';
 
 const MOCK_PUBLISH_URL = process.env.MOCK_PUBLISH_URL!;
 
+/**
+ * SQS batch handler.
+ * Uses partial batch response so failed records can be retried without dropping the full batch.
+ */
 export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
   const failures: { itemIdentifier: string }[] = [];
 
@@ -21,6 +39,9 @@ export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
   return { batchItemFailures: failures };
 }
 
+/**
+ * Perform the signed publish request to the mock marketplace.
+ */
 async function publishToMockMarketplace(message: PublishQueueMessage) {
   const secret = await getSigningSecret();
   const body = JSON.stringify({

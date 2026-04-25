@@ -26,11 +26,17 @@ export default function App() {
   const [title, setTitle] = useState('Vintage camera');
   const [description, setDescription] = useState('Works well. Includes strap and case.');
   const [price, setPrice] = useState('125.50');
+  const [basicUsername, setBasicUsername] = useState('demo');
+  const [basicPassword, setBasicPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const apiBaseUrl = useMemo(() => (config?.apiBaseUrl ?? fallbackConfig.apiBaseUrl).replace(/\/$/, ''), [config?.apiBaseUrl]);
+  const authorizationHeader = useMemo(() => {
+    if (!basicPassword) return null;
+    return `Basic ${btoa(`${basicUsername}:${basicPassword}`)}`;
+  }, [basicPassword, basicUsername]);
 
   async function loadConfig() {
     try {
@@ -44,7 +50,10 @@ export default function App() {
   }
 
   async function loadListings() {
-    const response = await fetch(`${apiBaseUrl}/listings`);
+    if (!authorizationHeader) throw new Error('Enter Basic Auth credentials to load listings');
+    const response = await fetch(`${apiBaseUrl}/listings`, {
+      headers: { authorization: authorizationHeader }
+    });
     if (!response.ok) throw new Error(`Failed to load listings: ${response.status}`);
     const data = await response.json();
     setListings(data.listings ?? []);
@@ -54,12 +63,13 @@ export default function App() {
 
   useEffect(() => {
     if (!configLoaded) return;
+    if (!authorizationHeader) return;
     loadListings().catch((err) => setError(err.message));
     const timer = window.setInterval(() => {
       loadListings().catch((err) => setError(err.message));
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [apiBaseUrl, configLoaded]);
+  }, [apiBaseUrl, authorizationHeader, configLoaded]);
 
   async function createListing(event: FormEvent) {
     event.preventDefault();
@@ -67,9 +77,10 @@ export default function App() {
     setError(null);
     setMessage(null);
     try {
+      if (!authorizationHeader) throw new Error('Enter Basic Auth credentials to create a listing');
       const response = await fetch(`${apiBaseUrl}/listings`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: authorizationHeader },
         body: JSON.stringify({ title, description, price })
       });
       const data = await response.json();
@@ -109,6 +120,13 @@ export default function App() {
       <section className="hero">
         <h1>Marketplace Aggregator</h1>
         <p>Create a listing once, publish it to a mocked eBay-like marketplace, and watch marketplace events roll into one activity feed.</p>
+        <div className="muted" style={{ marginTop: 12 }}>
+          <div><strong>Basic Auth</strong> (demo protection)</div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+            <label>Username<input value={basicUsername} onChange={(e) => setBasicUsername(e.target.value)} /></label>
+            <label>Password<input value={basicPassword} onChange={(e) => setBasicPassword(e.target.value)} type="password" /></label>
+          </div>
+        </div>
       </section>
       <div className="grid">
         <section className="card">

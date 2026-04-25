@@ -1,7 +1,23 @@
+/**
+ * App API Lambda
+ *
+ * This Lambda backs the user-facing API and the webhook receiver.
+ *
+ * Responsibilities:
+ * - `POST /listings`: validate + persist a listing, then enqueue async publish work
+ * - `GET /listings`: list all listings and recent activity for the demo tenant
+ * - `POST /webhooks/mock-ebay`: verify signed webhook events and write to activity feed
+ *
+ * Security model:
+ * - `/listings` is protected by HTTP Basic Auth (credentials stored in Secrets Manager)
+ * - `/webhooks/mock-ebay` is NOT Basic Auth protected; it is secured via HMAC signature
+ */
+
 import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from 'aws-lambda';
 import crypto from 'node:crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand, QueryCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import { jsonResponse, parseJsonBody, rawBody } from '../../shared/src/http';
 import { getSigningSecret } from '../../shared/src/secrets';
@@ -11,14 +27,107 @@ import type { ActivityItem, ListingItem, MarketplaceWebhookEvent, PublishQueueMe
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const sqs = new SQSClient({});
 
+/**
+ * Secrets Manager client used to fetch the Basic Auth credential bundle.
+ * Cached in memory for warm Lambda invocations.
+ */
+const secrets = new SecretsManagerClient({});
+
 const TABLE_NAME = process.env.TABLE_NAME!;
 const PUBLISH_QUEUE_URL = process.env.PUBLISH_QUEUE_URL!;
+const BASIC_AUTH_SECRET_ARN = process.env.BASIC_AUTH_SECRET_ARN;
 const TENANT_ID = 'demo';
 
+type BasicAuthSecret = { username: string; password: string };
+let cachedBasicAuth: BasicAuthSecret | null = null;
+
+/**
+ * Load and cache the Basic Auth credentials from Secrets Manager.
+ *
+ * Secret JSON shape:
+ * `{ "username": "demo", "password": "..." }`
+ */
+async function getBasicAuthSecret(): Promise<BasicAuthSecret> {
+  if (cachedBasicAuth) return cachedBasicAuth;
+  if (!BASIC_AUTH_SECRET_ARN) throw new Error('BASIC_AUTH_SECRET_ARN is not configured');
+
+  const response = await secrets.send(new GetSecretValueCommand({ SecretId: BASIC_AUTH_SECRET_ARN }));
+  if (!response.SecretString) throw new Error('Basic auth secret had no SecretString');
+
+  const parsed = JSON.parse(response.SecretString) as Partial<BasicAuthSecret>;
+  const username = String(parsed.username ?? '').trim();
+  const password = String(parsed.password ?? '');
+  if (!username || !password) throw new Error('Basic auth secret is missing username or password');
+
+  cachedBasicAuth = { username, password };
+  return cachedBasicAuth;
+}
+
+/**
+ * Standard 401 response for Basic Auth.
+ * Includes `WWW-Authenticate` so browsers/clients can prompt for credentials.
+ */
+function unauthorized(message: string): APIGatewayProxyStructuredResultV2 {
+  return {
+    statusCode: 401,
+    headers: {
+      'content-type': 'application/json',
+      'access-control-allow-origin': '*',
+      'access-control-allow-headers': 'authorization,content-type,x-mock-signature,x-mock-timestamp,x-internal-signature,x-internal-timestamp',
+      'access-control-allow-methods': 'GET,POST,OPTIONS',
+      'www-authenticate': 'Basic realm="Marketplace Aggregator", charset="UTF-8"'
+    },
+    body: JSON.stringify({ error: message })
+  };
+}
+
+/**
+ * Enforce HTTP Basic Auth for user-facing endpoints.
+ * Returns a structured API Gateway response on failure; otherwise returns `null`.
+ */
+async function requireBasicAuth(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyStructuredResultV2 | null> {
+  const authHeader = event.headers?.authorization ?? event.headers?.Authorization;
+  if (!authHeader?.startsWith('Basic ')) return unauthorized('Authentication required');
+
+  const encoded = authHeader.slice('Basic '.length).trim();
+  let decoded: string;
+  try {
+    decoded = Buffer.from(encoded, 'base64').toString('utf8');
+  } catch {
+    return unauthorized('Invalid credentials');
+  }
+
+  const colonIndex = decoded.indexOf(':');
+  if (colonIndex < 0) return unauthorized('Invalid credentials');
+
+  const username = decoded.slice(0, colonIndex);
+  const password = decoded.slice(colonIndex + 1);
+  const secret = await getBasicAuthSecret();
+
+  if (username !== secret.username) return unauthorized('Invalid credentials');
+
+  const supplied = Buffer.from(password);
+  const expected = Buffer.from(secret.password);
+  if (supplied.length !== expected.length) return unauthorized('Invalid credentials');
+  if (!crypto.timingSafeEqual(supplied, expected)) return unauthorized('Invalid credentials');
+
+  return null;
+}
+
+/**
+ * Simple router for API Gateway HTTP API (Lambda proxy).
+ *
+ * Important: Basic Auth is applied only to `/listings`, not to webhooks.
+ */
 export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyStructuredResultV2> {
   try {
     const method = event.requestContext.http.method;
     const path = event.rawPath;
+
+    if (path === '/listings' && (method === 'GET' || method === 'POST')) {
+      const authError = await requireBasicAuth(event);
+      if (authError) return authError;
+    }
 
     if (method === 'OPTIONS') return jsonResponse(204, {});
     if (path === '/listings' && method === 'POST') return await createListing(event);
@@ -32,6 +141,13 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
   }
 }
 
+/**
+ * Create a listing and enqueue async publish work.
+ *
+ * This function writes:
+ * - the Listing item (scoped to demo tenant)
+ * - an initial Activity feed entry
+ */
 async function createListing(event: APIGatewayProxyEventV2) {
   const body = parseJsonBody<{ title?: string; description?: string; price?: number | string }>(event.body, event.isBase64Encoded);
   const title = String(body.title ?? '').trim();
@@ -100,6 +216,13 @@ async function createListing(event: APIGatewayProxyEventV2) {
   return jsonResponse(201, { listing: toPublicListing(listing, [activity]) });
 }
 
+/**
+ * List all demo-tenant listings with a small slice of recent activity.
+ *
+ * DynamoDB pattern:
+ * - query tenant partition for listings
+ * - query per-listing partition for latest activity
+ */
 async function listListings() {
   const listingsResult = await ddb.send(new QueryCommand({
     TableName: TABLE_NAME,
@@ -124,6 +247,13 @@ async function listListings() {
   return jsonResponse(200, { listings });
 }
 
+/**
+ * Receive signed webhook events from the mock marketplace.
+ *
+ * Security:
+ * - verifies HMAC signature + timestamp window
+ * - deduplicates by event ID (conditional write)
+ */
 async function receiveMockWebhook(event: APIGatewayProxyEventV2) {
   const body = rawBody(event.body, event.isBase64Encoded);
   const secret = await getSigningSecret();
@@ -172,6 +302,9 @@ async function receiveMockWebhook(event: APIGatewayProxyEventV2) {
   return jsonResponse(202, { ok: true });
 }
 
+/**
+ * Convert a webhook event into a user-facing Activity feed item.
+ */
 function activityFromWebhook(event: MarketplaceWebhookEvent, createdAt: string): ActivityItem {
   const occurredAt = event.occurredAt || createdAt;
   const buyerAlias = String(event.payload?.buyerAlias ?? 'buyer');
@@ -198,6 +331,9 @@ function activityFromWebhook(event: MarketplaceWebhookEvent, createdAt: string):
   };
 }
 
+/**
+ * Prepare a DynamoDB UpdateExpression for the Listing record based on event type.
+ */
 function listingUpdateForEvent(event: MarketplaceWebhookEvent, latestActivity: string, now: string) {
   const names: Record<string, string> = { '#updatedAt': 'updatedAt', '#latestActivity': 'latestActivity', '#latestActivityAt': 'latestActivityAt' };
   const values: Record<string, unknown> = { ':updatedAt': now, ':latestActivity': latestActivity, ':latestActivityAt': event.occurredAt || now };
@@ -224,6 +360,9 @@ function listingUpdateForEvent(event: MarketplaceWebhookEvent, latestActivity: s
   return { expression: `SET ${sets.join(', ')}`, names, values };
 }
 
+/**
+ * Basic schema validation for inbound webhook events.
+ */
 function validateMarketplaceEvent(event: MarketplaceWebhookEvent): string | undefined {
   if (!event.eventId) return 'eventId is required';
   if (!event.listingId) return 'listingId is required';
@@ -234,6 +373,9 @@ function validateMarketplaceEvent(event: MarketplaceWebhookEvent): string | unde
   return undefined;
 }
 
+/**
+ * Trim internal DDB fields and present a UI-friendly DTO.
+ */
 function toPublicListing(listing: ListingItem, activities: ActivityItem[]) {
   return {
     listingId: listing.listingId,
@@ -257,6 +399,9 @@ function toPublicListing(listing: ListingItem, activities: ActivityItem[]) {
   };
 }
 
+/**
+ * Case-insensitive header lookup for API Gateway HTTP API.
+ */
 function header(event: APIGatewayProxyEventV2, name: string): string | undefined {
   const lower = name.toLowerCase();
   return event.headers?.[lower] ?? event.headers?.[name];

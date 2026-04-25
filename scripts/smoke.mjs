@@ -1,16 +1,39 @@
 #!/usr/bin/env node
+/**
+ * Deployed smoke test
+ *
+ * Runs an end-to-end flow against the deployed API:
+ * - create a listing
+ * - poll until it publishes
+ * - trigger a mock comment
+ * - trigger a mock sale
+ * - print the final listing + activity feed
+ *
+ * Note: `/listings` is protected by Basic Auth. Provide BASIC_AUTH_PASSWORD
+ * from Secrets Manager.
+ */
+
 const apiUrl = process.argv[2]?.replace(/\/$/, '');
 if (!apiUrl) {
   console.error('Usage: npm run smoke -- https://YOUR_API_URL');
   process.exit(1);
 }
 
+const username = process.env.BASIC_AUTH_USERNAME ?? 'demo';
+const password = process.env.BASIC_AUTH_PASSWORD;
+if (!password) {
+  console.error('Missing BASIC_AUTH_PASSWORD env var. Retrieve it from Secrets Manager (BasicAuthSecret) and re-run.');
+  process.exit(1);
+}
+
+const basicAuth = Buffer.from(`${username}:${password}`).toString('base64');
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function request(path, options = {}) {
   const response = await fetch(`${apiUrl}${path}`, {
     ...options,
-    headers: { 'content-type': 'application/json', ...(options.headers ?? {}) }
+    headers: { 'content-type': 'application/json', 'authorization': `Basic ${basicAuth}`, ...(options.headers ?? {}) }
   });
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};

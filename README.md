@@ -61,6 +61,42 @@ CDK outputs:
 - `SiteUrl` — open this in the browser.
 - `ApiUrl` — use this for smoke tests or manual event scripts.
 
+## \ud83d\udd10 Basic Auth credentials
+
+The user-facing API endpoints are protected by HTTP Basic Authentication:
+
+- `GET /listings`
+- `POST /listings`
+
+The following endpoints are intentionally **not** protected by Basic Auth:
+
+- `POST /webhooks/mock-ebay` (secured via HMAC signature)
+- `/mock-marketplace/*` (represents the external marketplace boundary)
+
+Credentials are generated automatically in AWS Secrets Manager during deployment.
+
+To retrieve them:
+
+```bash
+aws secretsmanager get-secret-value \
+  --secret-id MarketplaceAggregatorStack-BasicAuthSecret \
+  --query SecretString \
+  --output text
+```
+
+This returns JSON like:
+
+```json
+{ "username": "demo", "password": "<generated-password>" }
+```
+
+Use them in requests:
+
+```bash
+curl -X GET https://YOUR_API_ID.execute-api.YOUR_REGION.amazonaws.com/listings \
+  -u demo:<generated-password>
+```
+
 ## Try it in the browser
 
 1. Open `SiteUrl`.
@@ -73,7 +109,7 @@ CDK outputs:
 ## Smoke test against the deployed stack
 
 ```bash
-npm run smoke -- https://YOUR_API_ID.execute-api.YOUR_REGION.amazonaws.com
+BASIC_AUTH_PASSWORD=<generated-password> npm run smoke -- https://YOUR_API_ID.execute-api.YOUR_REGION.amazonaws.com
 ```
 
 The script creates a listing, waits for publish, triggers a mock comment, triggers a mock sale, and prints the resulting activity.

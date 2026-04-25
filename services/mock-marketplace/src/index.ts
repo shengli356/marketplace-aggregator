@@ -1,3 +1,17 @@
+/**
+ * Mock Marketplace Lambda
+ *
+ * This Lambda represents the external marketplace boundary (eBay-like).
+ * It exists to demonstrate the realities of third-party integrations:
+ * - asynchronous workflows
+ * - rate limiting and transient failures
+ * - idempotency requirements
+ *
+ * Endpoints:
+ * - `POST /mock-marketplace/publish`: signed internal call from our publish worker
+ * - `POST /mock-marketplace/events`: demo-only manual injector for comment/sale events
+ */
+
 import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
@@ -12,6 +26,11 @@ const sqs = new SQSClient({});
 
 const TABLE_NAME = process.env.TABLE_NAME!;
 const MOCK_EVENT_QUEUE_URL = process.env.MOCK_EVENT_QUEUE_URL!;
+
+/**
+ * Synthetic failure rate used to simulate 429s and 5xx errors.
+ * Default is ~15% to prove retry/idempotency behavior.
+ */
 const FAILURE_RATE = Number(process.env.SIMULATED_FAILURE_RATE ?? '0.15');
 const TENANT_ID = 'demo';
 
@@ -47,6 +66,19 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
   }
 }
 
+/**
+ * Accept a publish request from our system.
+ *
+ * Security:
+ * - requires an internal HMAC signature on the request
+ *
+ * Correctness:
+ * - enforces idempotency by recording `MOCK_PUBLISH#<idempotencyKey>`
+ * - intentionally returns 429/503 sometimes to trigger retries
+ *
+ * Side effects:
+ * - on success, enqueues a `listing_published` event onto the mock event queue
+ */
 async function publish(event: APIGatewayProxyEventV2) {
   const raw = rawBody(event.body, event.isBase64Encoded);
   const secret = await getSigningSecret();
@@ -104,6 +136,10 @@ async function publish(event: APIGatewayProxyEventV2) {
   return jsonResponse(202, { accepted: true, marketplaceListingId });
 }
 
+/**
+ * Demo-only endpoint to trigger marketplace events (comment/sale) without waiting.
+ * In a real integration, the marketplace would POST webhooks to our receiver.
+ */
 async function triggerManualEvent(event: APIGatewayProxyEventV2) {
   const body = parseJsonBody<ManualEventRequest>(event.body, event.isBase64Encoded);
   if (!body.listingId) return jsonResponse(400, { error: 'listingId is required' });
@@ -121,6 +157,10 @@ async function triggerManualEvent(event: APIGatewayProxyEventV2) {
   return jsonResponse(202, { accepted: true });
 }
 
+/**
+ * Enqueue an event onto the mock event queue.
+ * A separate SQS-triggered Lambda (mock-event-emitter) delivers the signed webhook.
+ */
 async function enqueueMarketplaceEvent(params: {
   eventType: MarketplaceEventType;
   listingId: string;
@@ -143,6 +183,9 @@ async function enqueueMarketplaceEvent(params: {
   }));
 }
 
+/**
+ * Case-insensitive header lookup for API Gateway HTTP API.
+ */
 function header(event: APIGatewayProxyEventV2, name: string): string | undefined {
   const lower = name.toLowerCase();
   return event.headers?.[lower] ?? event.headers?.[name];

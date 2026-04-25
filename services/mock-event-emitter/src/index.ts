@@ -1,3 +1,16 @@
+/**
+ * Mock Event Emitter Lambda
+ *
+ * Trigger: SQS mock event queue.
+ *
+ * Responsibility:
+ * - take marketplace events from the queue
+ * - convert them into a canonical webhook payload
+ * - POST them to our webhook receiver with an HMAC signature
+ *
+ * This simulates a third-party marketplace webhook delivery path.
+ */
+
 import type { SQSEvent, SQSBatchResponse } from 'aws-lambda';
 import crypto from 'node:crypto';
 import { getSigningSecret } from '../../shared/src/secrets';
@@ -6,6 +19,10 @@ import type { MarketplaceWebhookEvent } from '../../shared/src/types';
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL!;
 
+/**
+ * SQS batch handler.
+ * Uses partial batch response so individual failed deliveries can be retried.
+ */
 export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
   const failures: { itemIdentifier: string }[] = [];
 
@@ -32,6 +49,9 @@ export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
   return { batchItemFailures: failures };
 }
 
+/**
+ * Deliver a single signed webhook event to the app API.
+ */
 async function sendWebhook(event: MarketplaceWebhookEvent) {
   const secret = await getSigningSecret();
   const body = JSON.stringify(event);

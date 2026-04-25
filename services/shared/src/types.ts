@@ -1,3 +1,17 @@
+/**
+ * Shared domain types
+ *
+ * These types are used by:
+ * - API Lambda (listings + webhook receiver)
+ * - publish worker (SQS message contract)
+ * - mock marketplace (event shapes)
+ * - mock event emitter (webhook payload)
+ *
+ * DynamoDB single-table design (high level):
+ * - Listings live under `PK=TENANT#<tenantId>` with `SK=LISTING#<listingId>`
+ * - Activity feed entries live under `PK=LISTING#<listingId>` with `SK=ACTIVITY#<time>#<eventId>`
+ */
+
 export type ListingStatus = 'PENDING_PUBLISH' | 'PUBLISHING' | 'PUBLISHED' | 'PUBLISH_FAILED' | 'SOLD';
 
 export type MarketplaceEventType = 'listing_published' | 'publish_failed' | 'new_comment' | 'item_sold';
