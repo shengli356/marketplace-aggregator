@@ -124,7 +124,12 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     const method = event.requestContext.http.method;
     const path = event.rawPath;
 
-    if (path === '/listings' && (method === 'GET' || method === 'POST')) {
+    const retryMatch = path.match(/^\/listings\/([^/]+)\/retry-publish$/);
+
+    if (
+      (path === '/listings' && (method === 'GET' || method === 'POST'))
+      || (retryMatch && method === 'POST')
+    ) {
       const authError = await requireBasicAuth(event);
       if (authError) return authError;
     }
@@ -132,6 +137,7 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     if (method === 'OPTIONS') return jsonResponse(204, {});
     if (path === '/listings' && method === 'POST') return await createListing(event);
     if (path === '/listings' && method === 'GET') return await listListings();
+    if (retryMatch && method === 'POST') return await retryPublish(retryMatch[1]);
     if (path === '/webhooks/mock-ebay' && method === 'POST') return await receiveMockWebhook(event);
 
     return jsonResponse(404, { error: 'Not found' });
@@ -175,6 +181,7 @@ async function createListing(event: APIGatewayProxyEventV2) {
     status: 'PENDING_PUBLISH',
     marketplace: 'mock-ebay',
     publishIdempotencyKey,
+    publishAttemptCount: 0,
     latestActivity: 'Listing created; publish queued',
     latestActivityAt: now,
     createdAt: now,
@@ -303,6 +310,82 @@ async function receiveMockWebhook(event: APIGatewayProxyEventV2) {
 }
 
 /**
+ * User-triggered retry endpoint.
+ *
+ * Re-queues an existing listing publish without creating a duplicate listing.
+ */
+async function retryPublish(listingId: string) {
+  const result = await ddb.send(new QueryCommand({
+    TableName: TABLE_NAME,
+    KeyConditionExpression: 'pk = :pk AND sk = :sk',
+    ExpressionAttributeValues: {
+      ':pk': `TENANT#${TENANT_ID}`,
+      ':sk': `LISTING#${listingId}`
+    },
+    Limit: 1
+  }));
+
+  const listing = (result.Items?.[0] as ListingItem | undefined);
+  if (!listing) return jsonResponse(404, { error: 'Listing not found' });
+  if (listing.status !== 'PUBLISH_FAILED') return jsonResponse(400, { error: `Cannot retry publish from status ${listing.status}` });
+
+  const now = new Date().toISOString();
+  const activity: ActivityItem = {
+    pk: `LISTING#${listingId}`,
+    sk: `ACTIVITY#${now}#publish-retry-requested`,
+    entityType: 'ACTIVITY',
+    tenantId: listing.tenantId,
+    listingId,
+    eventId: `publish-retry-requested-${listingId}-${now}`,
+    eventType: 'publish_retry_requested',
+    source: 'app',
+    message: 'Retry requested; publish queued',
+    occurredAt: now,
+    createdAt: now
+  };
+
+  await ddb.send(new TransactWriteCommand({
+    TransactItems: [
+      { Put: { TableName: TABLE_NAME, Item: activity } },
+      {
+        Update: {
+          TableName: TABLE_NAME,
+          Key: { pk: `TENANT#${listing.tenantId}`, sk: `LISTING#${listingId}` },
+          ConditionExpression: 'attribute_exists(pk)',
+          ExpressionAttributeNames: {
+            '#status': 'status',
+            '#updatedAt': 'updatedAt',
+            '#latestActivity': 'latestActivity',
+            '#latestActivityAt': 'latestActivityAt'
+          },
+          ExpressionAttributeValues: {
+            ':status': 'PENDING_PUBLISH',
+            ':updatedAt': now,
+            ':latestActivity': 'Retry requested; publish queued',
+            ':latestActivityAt': now,
+            ':publishAttemptCount': 0
+          },
+          UpdateExpression: 'SET #status = :status, #updatedAt = :updatedAt, #latestActivity = :latestActivity, #latestActivityAt = :latestActivityAt, publishAttemptCount = :publishAttemptCount REMOVE lastPublishError, lastPublishErrorCode, nextRetryAt, lastPublishAttemptAt'
+        }
+      }
+    ]
+  }));
+
+  const message: PublishQueueMessage = {
+    tenantId: listing.tenantId,
+    listingId,
+    idempotencyKey: listing.publishIdempotencyKey,
+    title: listing.title,
+    description: listing.description,
+    priceCents: listing.priceCents
+  };
+
+  await sqs.send(new SendMessageCommand({ QueueUrl: PUBLISH_QUEUE_URL, MessageBody: JSON.stringify(message) }));
+
+  return jsonResponse(202, { status: 'retry_queued' });
+}
+
+/**
  * Convert a webhook event into a user-facing Activity feed item.
  */
 function activityFromWebhook(event: MarketplaceWebhookEvent, createdAt: string): ActivityItem {
@@ -338,6 +421,7 @@ function listingUpdateForEvent(event: MarketplaceWebhookEvent, latestActivity: s
   const names: Record<string, string> = { '#updatedAt': 'updatedAt', '#latestActivity': 'latestActivity', '#latestActivityAt': 'latestActivityAt' };
   const values: Record<string, unknown> = { ':updatedAt': now, ':latestActivity': latestActivity, ':latestActivityAt': event.occurredAt || now };
   const sets = ['#updatedAt = :updatedAt', '#latestActivity = :latestActivity', '#latestActivityAt = :latestActivityAt'];
+  const removes: string[] = [];
 
   if (event.eventType === 'listing_published') {
     names['#status'] = 'status';
@@ -345,6 +429,8 @@ function listingUpdateForEvent(event: MarketplaceWebhookEvent, latestActivity: s
     values[':status'] = 'PUBLISHED';
     values[':marketplaceListingId'] = event.marketplaceListingId;
     sets.push('#status = :status', '#marketplaceListingId = :marketplaceListingId');
+
+    removes.push('lastPublishError', 'lastPublishErrorCode', 'nextRetryAt');
   }
   if (event.eventType === 'publish_failed') {
     names['#status'] = 'status';
@@ -357,7 +443,8 @@ function listingUpdateForEvent(event: MarketplaceWebhookEvent, latestActivity: s
     sets.push('#status = :status');
   }
 
-  return { expression: `SET ${sets.join(', ')}`, names, values };
+  const removeClause = removes.length ? ` REMOVE ${removes.join(', ')}` : '';
+  return { expression: `SET ${sets.join(', ')}${removeClause}`, names, values };
 }
 
 /**
@@ -385,6 +472,11 @@ function toPublicListing(listing: ListingItem, activities: ActivityItem[]) {
     status: listing.status,
     marketplace: listing.marketplace,
     marketplaceListingId: listing.marketplaceListingId,
+    publishAttemptCount: listing.publishAttemptCount,
+    lastPublishError: listing.lastPublishError,
+    lastPublishErrorCode: listing.lastPublishErrorCode,
+    lastPublishAttemptAt: listing.lastPublishAttemptAt,
+    nextRetryAt: listing.nextRetryAt,
     latestActivity: listing.latestActivity,
     latestActivityAt: listing.latestActivityAt,
     createdAt: listing.createdAt,

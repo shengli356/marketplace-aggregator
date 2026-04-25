@@ -106,6 +106,23 @@ curl -X GET https://YOUR_API_ID.execute-api.YOUR_REGION.amazonaws.com/listings \
 5. Click **Mock comment** or **Mock sale** on a published listing.
 6. Confirm the activity feed updates.
 
+## Publish status + retry
+
+Listings move through a small publish lifecycle:
+
+- **Queued** (`PENDING_PUBLISH`)
+- **Publishing** (`PUBLISHING`)
+- **Retrying** (`PUBLISH_RETRYING`) — automatic retries for transient failures
+- **Published** (`PUBLISHED`)
+- **Needs attention** (`PUBLISH_FAILED`) — either a non-retryable rejection or retry exhaustion
+- **Sold** (`SOLD`)
+
+If publishing fails, the UI exposes a **Retry publish** action which calls:
+
+`POST /listings/{listingId}/retry-publish`
+
+This is only allowed when the listing is in `PUBLISH_FAILED`. It re-queues publish work for the existing listing (no duplicate listing record is created), reuses the same publish idempotency key, and resets `publishAttemptCount` for the new publish run.
+
 ## Smoke test against the deployed stack
 
 ```bash
@@ -180,6 +197,44 @@ Single DynamoDB table with composite primary key:
 For a one-day prototype run with a handful of listings/events, expected cost is near zero to a few cents, depending on account free-tier status and log volume. The only persistent paid service likely to show a visible line item is Secrets Manager, roughly pennies per day for one secret. S3/CloudFront/API Gateway/Lambda/DynamoDB/SQS usage should be tiny at demo volume.
 
 At the assignment's sizing target — about 10 sellers, 1k listings, and 10k events/month — this remains well under a few dollars/month in a typical US region if payloads stay small and logs are retained briefly. The first real cost wall is not compute; it is usually API/event volume, verbose CloudWatch logs, or adding always-on services such as NAT gateways, provisioned databases, or OpenSearch.
+
+## CloudWatch metrics / alarms to add first
+
+1. **SQS DLQ depth**
+   - `ApproximateNumberOfMessagesVisible > 0`
+   - Queues: `PublishDlq`, `MockEventDlq`
+   - Why: failed publish jobs or failed webhook deliveries need operator attention.
+
+2. **Lambda errors**
+   - `Errors > 0`
+   - Functions: API, publish worker, mock marketplace, event emitter
+   - Why: catches broken routes, failed retries, bad payload handling, or integration issues.
+
+3. **Lambda throttles**
+   - `Throttles > 0`
+   - Why: indicates concurrency limits or traffic spikes.
+
+4. **API Gateway 5xx rate**
+   - `5XXError > 0`
+   - Why: user-facing backend failure.
+
+5. **API Gateway 4xx spike**
+   - Sudden increase in `4XXError`
+   - Why: could indicate bad clients, auth failures, webhook signature issues, or abuse.
+
+6. **DynamoDB throttles / system errors**
+   - `ThrottledRequests > 0`
+   - `SystemErrors > 0`
+   - Why: indicates persistence-layer issues.
+
+7. **Queue age**
+   - `ApproximateAgeOfOldestMessage`
+   - Queues: `PublishQueue`, `MockEventQueue`
+   - Why: detects stuck async processing before messages hit the DLQ.
+
+8. **CloudWatch log retention**
+   - Set Lambda log groups to 7–14 days for prototype
+   - Why: prevents silent log-storage cost growth.
 
 ## Tear down
 

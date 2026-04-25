@@ -93,7 +93,7 @@ export class MarketplaceAggregatorStack extends cdk.Stack {
       retentionPeriod: cdk.Duration.days(14)
     });
     const publishQueue = new sqs.Queue(this, 'PublishQueue', {
-      visibilityTimeout: cdk.Duration.seconds(45),
+      visibilityTimeout: cdk.Duration.seconds(30),
       retentionPeriod: cdk.Duration.days(4),
       deadLetterQueue: { queue: publishDlq, maxReceiveCount: 4 }
     });
@@ -107,7 +107,7 @@ export class MarketplaceAggregatorStack extends cdk.Stack {
       retentionPeriod: cdk.Duration.days(14)
     });
     const mockEventQueue = new sqs.Queue(this, 'MockEventQueue', {
-      visibilityTimeout: cdk.Duration.seconds(45),
+      visibilityTimeout: cdk.Duration.seconds(30),
       retentionPeriod: cdk.Duration.days(4),
       deadLetterQueue: { queue: mockEventDlq, maxReceiveCount: 4 }
     });
@@ -172,6 +172,14 @@ export class MarketplaceAggregatorStack extends cdk.Stack {
       }
     });
 
+    const publishDlqHandlerFn = new lambdaNode.NodejsFunction(this, 'PublishDlqHandlerFunction', {
+      ...fnDefaults,
+      entry: path.join(__dirname, '../../services/publish-dlq-handler/src/index.ts'),
+      environment: {
+        ...commonEnv
+      }
+    });
+
     /**
      * Mock marketplace Lambda
      *
@@ -186,7 +194,7 @@ export class MarketplaceAggregatorStack extends cdk.Stack {
       environment: {
         ...commonEnv,
         MOCK_EVENT_QUEUE_URL: mockEventQueue.queueUrl,
-        SIMULATED_FAILURE_RATE: '0.15'
+        SIMULATED_FAILURE_RATE: '0.30'
       }
     });
 
@@ -209,6 +217,7 @@ export class MarketplaceAggregatorStack extends cdk.Stack {
     table.grantReadWriteData(apiFn);
     table.grantReadWriteData(mockMarketplaceFn);
     table.grantReadWriteData(publishWorkerFn);
+    table.grantReadWriteData(publishDlqHandlerFn);
     publishQueue.grantSendMessages(apiFn);
     mockEventQueue.grantSendMessages(mockMarketplaceFn);
     signingSecret.grantRead(apiFn);
@@ -222,6 +231,11 @@ export class MarketplaceAggregatorStack extends cdk.Stack {
      */
 
     publishWorkerFn.addEventSource(new eventSources.SqsEventSource(publishQueue, {
+      batchSize: 1,
+      reportBatchItemFailures: true
+    }));
+
+    publishDlqHandlerFn.addEventSource(new eventSources.SqsEventSource(publishDlq, {
       batchSize: 1,
       reportBatchItemFailures: true
     }));

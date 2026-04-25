@@ -12,7 +12,13 @@
  * - Activity feed entries live under `PK=LISTING#<listingId>` with `SK=ACTIVITY#<time>#<eventId>`
  */
 
-export type ListingStatus = 'PENDING_PUBLISH' | 'PUBLISHING' | 'PUBLISHED' | 'PUBLISH_FAILED' | 'SOLD';
+export type ListingStatus =
+  | 'PENDING_PUBLISH'
+  | 'PUBLISHING'
+  | 'PUBLISH_RETRYING'
+  | 'PUBLISHED'
+  | 'PUBLISH_FAILED'
+  | 'SOLD';
 
 export type MarketplaceEventType = 'listing_published' | 'publish_failed' | 'new_comment' | 'item_sold';
 
@@ -29,6 +35,11 @@ export interface ListingItem {
   marketplace: 'mock-ebay';
   publishIdempotencyKey: string;
   marketplaceListingId?: string;
+  publishAttemptCount?: number;
+  lastPublishError?: string;
+  lastPublishErrorCode?: string;
+  lastPublishAttemptAt?: string;
+  nextRetryAt?: string;
   latestActivity?: string;
   latestActivityAt?: string;
   createdAt: string;
@@ -42,7 +53,7 @@ export interface ActivityItem {
   tenantId: string;
   listingId: string;
   eventId: string;
-  eventType: MarketplaceEventType | 'listing_created';
+  eventType: MarketplaceEventType | 'listing_created' | 'publish_retry_requested' | 'publish_attempted' | 'publish_retry_exhausted';
   source: 'app' | 'mock-ebay';
   message: string;
   occurredAt: string;

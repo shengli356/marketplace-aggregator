@@ -6,9 +6,14 @@ type Listing = {
   title: string;
   description: string;
   priceCents: number;
-  status: 'PENDING_PUBLISH' | 'PUBLISHING' | 'PUBLISHED' | 'PUBLISH_FAILED' | 'SOLD';
+  status: 'PENDING_PUBLISH' | 'PUBLISHING' | 'PUBLISH_RETRYING' | 'PUBLISHED' | 'PUBLISH_FAILED' | 'SOLD';
   marketplace: string;
   marketplaceListingId?: string;
+  publishAttemptCount?: number;
+  lastPublishError?: string;
+  lastPublishErrorCode?: string;
+  lastPublishAttemptAt?: string;
+  nextRetryAt?: string;
   latestActivity?: string;
   latestActivityAt?: string;
   createdAt: string;
@@ -38,6 +43,20 @@ export default function App() {
     return `Basic ${btoa(`${basicUsername}:${basicPassword}`)}`;
   }, [basicPassword, basicUsername]);
 
+  const statusLabel = useMemo(() => {
+    const map: Record<Listing['status'], string> = {
+      PENDING_PUBLISH: 'Queued',
+      PUBLISHING: 'Publishing',
+      PUBLISH_RETRYING: 'Retrying',
+      PUBLISHED: 'Published',
+      PUBLISH_FAILED: 'Needs attention',
+      SOLD: 'Sold'
+    };
+    return map;
+  }, []);
+
+  const MAX_PUBLISH_ATTEMPTS = 4;
+
   async function loadConfig() {
     try {
       const response = await fetch('/config.json', { cache: 'no-store' });
@@ -46,6 +65,24 @@ export default function App() {
       setConfig(fallbackConfig);
     } finally {
       setConfigLoaded(true);
+    }
+  }
+
+  async function retryPublish(listing: Listing) {
+    setError(null);
+    setMessage(null);
+    try {
+      if (!authorizationHeader) throw new Error('Enter Basic Auth credentials to retry publish');
+      const response = await fetch(`${apiBaseUrl}/listings/${listing.listingId}/retry-publish`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: authorizationHeader }
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? `Retry failed: ${response.status}`);
+      setMessage('Retry queued. The listing will move through Publishing/Retrying automatically.');
+      await loadListings();
+    } catch (err: any) {
+      setError(err.message ?? 'Retry failed');
     }
   }
 
@@ -152,11 +189,30 @@ export default function App() {
                   <strong>{listing.title}</strong>
                   <div className="muted">${(listing.priceCents / 100).toFixed(2)} · {listing.marketplaceListingId ?? 'not published yet'}</div>
                 </div>
-                <span className={`status ${listing.status}`}>{listing.status}</span>
+                <span className={`status ${listing.status}`}>{statusLabel[listing.status]}</span>
               </div>
               {listing.description && <p>{listing.description}</p>}
+
+              {(listing.status === 'PUBLISH_RETRYING' || listing.status === 'PUBLISH_FAILED' || listing.status === 'PUBLISHING') && (
+                <p className="muted">
+                  {listing.lastPublishError ?? (listing.status === 'PUBLISHING' ? 'Publishing in progress…' : '')}
+                  {(listing.publishAttemptCount ?? 0) > 0 && (
+                    <>
+                      <br />
+                      Attempt {listing.publishAttemptCount} of {MAX_PUBLISH_ATTEMPTS}
+                    </>
+                  )}
+                  {listing.nextRetryAt && listing.status === 'PUBLISH_RETRYING' && (
+                    <>
+                      <br />
+                      Next retry at {new Date(listing.nextRetryAt).toLocaleTimeString()}
+                    </>
+                  )}
+                </p>
+              )}
+
               <ul className="activity">
-                {listing.activities.map((activity) => (
+                {listing.activities.map((activity: Activity) => (
                   <li key={activity.eventId}>
                     <strong>{activity.eventType}</strong> — {activity.message}<br />
                     <small className="muted">{new Date(activity.occurredAt).toLocaleString()} · {activity.source}</small>
@@ -164,6 +220,9 @@ export default function App() {
                 ))}
               </ul>
               <div className="actions">
+                {listing.status === 'PUBLISH_FAILED' && (
+                  <button className="secondary" onClick={() => retryPublish(listing)}>Retry publish</button>
+                )}
                 <button className="secondary" disabled={!listing.marketplaceListingId || listing.status === 'SOLD'} onClick={() => triggerEvent(listing, 'new_comment')}>Mock comment</button>
                 <button className="secondary" disabled={!listing.marketplaceListingId || listing.status === 'SOLD'} onClick={() => triggerEvent(listing, 'item_sold')}>Mock sale</button>
               </div>

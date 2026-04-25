@@ -41,6 +41,26 @@ I would choose eBay as the conceptual reference because it has mature seller API
 - **Retry strategy:** SQS handles retries with DLQs. Marketplace 429/5xx errors are retryable with backoff; validation/4xx errors should stop and mark the listing as failed.
 - **Abuse resistance:** In production, protect seller APIs with auth, add per-tenant rate limits, validate payload sizes, and remove the public demo event injector.
 
+### Publish reliability and retries
+
+Publishing is asynchronous via SQS, which provides retry semantics and DLQ isolation.
+
+Lifecycle states:
+
+- `PENDING_PUBLISH`
+- `PUBLISHING`
+- `PUBLISH_RETRYING`
+- `PUBLISHED`
+- `PUBLISH_FAILED`
+
+Transient marketplace errors (429 / 5xx / timeouts) transition the listing into `PUBLISH_RETRYING` and are retried automatically by SQS. If retries are exhausted and the message lands in the Publish DLQ, the listing is marked `PUBLISH_FAILED` with a retry-exhausted error so the failure is visible to the seller.
+
+A dedicated endpoint allows re-queueing a failed listing without creating a duplicate listing record:
+
+`POST /listings/{listingId}/retry-publish`
+
+This is only allowed from `PUBLISH_FAILED`. The retry reuses the same publish idempotency key (to prevent duplicate marketplace listings) and resets the publish attempt counter for the new publish run.
+
 ## Cost
 
 At 10 sellers, 1k listings, and 10k events/month, the stack should be very low cost. Lambda, SQS, DynamoDB on-demand, API Gateway HTTP API, S3, and CloudFront are all usage-based. The prototype's expected monthly usage is far below typical free-tier or low-tier thresholds, aside from small Secrets Manager and CloudWatch log costs. A realistic estimate is under a few dollars/month in a US region if logs are retained briefly and payloads stay small.
