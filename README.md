@@ -7,7 +7,7 @@ Minimal serverless slice for a marketplace aggregator. A seller can create a lis
 - Frontend served from S3 behind CloudFront.
 - `POST /listings` persists a listing and enqueues publish work.
 - Mock marketplace boundary with its own Lambda route: `POST /mock-marketplace/publish`.
-- Mock publish is asynchronous, has a synthetic 15% failure/rate-limit rate, and relies on SQS retries.
+- Mock publish is asynchronous, has a synthetic 15% failure/rate-limit rate, and relies on SQS retries. (failure rate increased to 30% for demo purpose to show retry and idempotency in action)
 - Webhook receiver: `POST /webhooks/mock-ebay` verifies HMAC signatures and deduplicates events.
 - DynamoDB stores listings, marketplace publish idempotency records, webhook dedupe records, and per-listing activity.
 - Manual/demo event trigger from the UI and CLI for `new_comment` and `item_sold`.
@@ -16,27 +16,76 @@ Minimal serverless slice for a marketplace aggregator. A seller can create a lis
 ## Architecture
 
 ```mermaid
-flowchart LR
-  U[Seller browser] --> CF[CloudFront]
-  CF --> S3[S3 static site]
-  U --> API[API Gateway HTTP API]
-  API --> App[App API Lambda]
-  App --> DDB[(DynamoDB single table)]
-  App --> PQ[SQS publish queue]
-  PQ --> Worker[Publish worker Lambda]
-  Worker --> API
-  API --> Mock[Mock marketplace Lambda]
-  Mock --> DDB
-  Mock --> MQ[SQS mock event queue]
-  MQ --> Emitter[Mock event emitter Lambda]
-  Emitter --> API
-  API --> Webhook[Webhook route in App Lambda]
-  Webhook --> DDB
-  Secrets[Secrets Manager HMAC secret] --> App
-  Secrets --> Worker
-  Secrets --> Mock
-  Secrets --> Emitter
-```
+flowchart TB
+  %% Client + hosting
+  subgraph Client["Client"]
+    Browser["Seller Browser"]
+  end
+
+  subgraph Frontend["Frontend Hosting"]
+    CF["CloudFront"]
+    S3["S3 Static Site"]
+  end
+
+  Browser --> CF
+  CF --> S3
+
+  %% Backend API
+  subgraph APIGroup["Backend API"]
+    APIGW["API Gateway HTTP API"]
+    AppAPI["App API Lambda<br/>/listings<br/>/webhooks/mock-ebay"]
+  end
+
+  Browser --> APIGW
+  APIGW --> AppAPI
+
+  %% Persistence + secrets
+  subgraph Data["Persistence / Secrets"]
+    DDB[("DynamoDB<br/>Listings + Activity Feed")]
+    Secrets["Secrets Manager<br/>HMAC + Basic Auth"]
+  end
+
+  AppAPI <--> DDB
+  Secrets --> AppAPI
+
+  %% Publish flow
+  subgraph PublishFlow["Async Publish Flow"]
+    PublishQueue["SQS Publish Queue"]
+    PublishWorker["Publish Worker Lambda"]
+    PublishDLQ["Publish DLQ"]
+    PublishDLQHandler["Publish DLQ Handler Lambda"]
+  end
+
+  AppAPI -->|"enqueue publish job"| PublishQueue
+  PublishQueue -->|"SQS event source"| PublishWorker
+  PublishQueue -. "after max retries" .-> PublishDLQ
+  PublishDLQ -->|"SQS event source"| PublishDLQHandler
+  PublishDLQHandler -->|"mark PUBLISH_FAILED"| DDB
+  Secrets --> PublishWorker
+
+  %% Mock marketplace
+  subgraph Marketplace["Mock Marketplace Boundary"]
+    MockAPI["Mock Marketplace Lambda<br/>/mock-marketplace/publish<br/>/mock-marketplace/events"]
+    EventQueue["SQS Mock Event Queue"]
+    EventDLQ["Mock Event DLQ"]
+    EventEmitter["Mock Event Emitter Lambda"]
+  end
+
+  PublishWorker -->|"signed POST /mock-marketplace/publish"| APIGW
+  APIGW --> MockAPI
+
+  MockAPI -->|"enqueue listing_published / comment / sale"| EventQueue
+  EventQueue -->|"SQS event source"| EventEmitter
+  EventQueue -. "after max retries" .-> EventDLQ
+  Secrets --> MockAPI
+  Secrets --> EventEmitter
+
+  %% Webhook delivery
+  EventEmitter -->|"signed POST /webhooks/mock-ebay"| APIGW
+  AppAPI -->|"verify HMAC + update feed"| DDB
+
+  %% UI refresh
+  Browser -. "polls GET /listings every 3s" .-> APIGW
 
 ## Prerequisites
 
